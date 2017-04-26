@@ -21,6 +21,9 @@ function Get-TargetResource
         [PSCredential] $DomainAdministratorCredential
     )
 
+    $localHost = $env:ComputerName
+    $primaryReplica = $localHost.Substring(0,$localHost.Length-2) + "01"
+
     $ComputerInfo = Get-WmiObject Win32_ComputerSystem
     if (($ComputerInfo -eq $null) -or ($ComputerInfo.Domain -eq $null))
     {
@@ -31,12 +34,23 @@ function Get-TargetResource
     {
         ($oldToken, $context, $newToken) = ImpersonateAs -cred $DomainAdministratorCredential
         $cluster = Get-Cluster -Name $Name -Domain $ComputerInfo.Domain
-        if ($null -eq $cluster)
-        {
-            throw "Can't find the cluster $Name"
-        }
+        if ($null -ne $cluster)
+            {
+ 
+                $clusterGroup = Get-ClusterGroup -Cluster $Name -Name "Cluster Group" -ErrorAction SilentlyContinue
+                $ownerNode = ($clusterGroup).OwnerNode.Name
 
-        $address = Get-ClusterGroup -Cluster $Name -Name "Cluster IP Address" | Get-ClusterParameter "Address"
+                if ($clusterGroup -eq $null)
+                    {
+                        $clusterGroup = Get-ClusterGroup -Cluster $primaryReplica -Name "Cluster Group"
+                        $ownerNode = ($clusterGroup).OwnerNode.Name
+                    }
+                    if ($clusterGroup -eq $null)
+                        {
+                            $clusterGroup = Get-ClusterGroup -Cluster $env:ComputerName -Name "Cluster Group"
+                            $ownerNode = ($clusterGroup).OwnerNode.Name
+                        }
+                }
     }
     finally
     {
@@ -49,13 +63,13 @@ function Get-TargetResource
     }
 
     $retvalue = @{
-        Name = $Name
-        StaticIPAddress = $address.Value
+        Name = $ownerNode
+        State= $clusterGroup.State
+        Domain = $ComputerInfo.Domain
     }
     $retvalue
 }
 
-#
 # The Set-TargetResource cmdlet.
 #
 function Set-TargetResource
@@ -71,6 +85,9 @@ function Set-TargetResource
         [parameter(Mandatory)]
         [PSCredential] $DomainAdministratorCredential
     )
+
+    $localHost = $env:ComputerName
+    $primaryReplica = $localHost.Substring(0,$localHost.Length-2) + "01"
 
     $bCreate = $true
 
@@ -118,8 +135,17 @@ function Set-TargetResource
             Write-Verbose -Message "Add node to Cluster $Name ..."
 
             Write-Verbose -Message "Add-ClusterNode $env:COMPUTERNAME to cluster $Name"
+
+            $clusterGroup = Get-ClusterGroup -Cluster $Name -Name "Cluster Group" -ErrorAction SilentlyContinue
+    
+            If ($clusteGroup -eq $null)
+                {
+                    $clusterGroup = Get-ClusterGroup -Cluster $primaryReplica -Name "Cluster Group"
+                    $Name = ($clusterGroup).OwnerNode.Name
+                }
                            
             $list = Get-ClusterNode -Cluster $Name
+
             foreach ($node in $list)
             {
                 if ($node.Name -eq $env:COMPUTERNAME)
@@ -149,9 +175,7 @@ function Set-TargetResource
         }
     }
 }
-
 # 
-# Test-TargetResource
 #
 # The code will check the following in order: 
 # 1. Is machine in domain?
@@ -161,6 +185,7 @@ function Set-TargetResource
 #  
 # Function will return FALSE if any above is not true. Which causes cluster to be configured.
 # 
+
 function Test-TargetResource  
 {
     [OutputType([Boolean])]
@@ -175,8 +200,28 @@ function Test-TargetResource
         [parameter(Mandatory)]
         [PSCredential] $DomainAdministratorCredential
     )
+    
+    $localHost = $env:ComputerName
+    $primaryReplica = $localHost.Substring(0,$localHost.Length-2) + "01" #Need to add primary replica to parameter set to avoid hard-coding
 
     $bRet = $false
+
+    $currentValue = Get-TargetResource -Name $Name -StaticIPAddress $StaticIPAddress -DomainAdministratorCredential $DomainAdministratorCredential -ErrorAction SilentlyContinue
+
+    $cluster = Get-Cluster -Name $Name -Domain $currentValue.Domain
+
+    If ($currentValue.Name -ne $Name)
+        {
+            $ownerNode = $currentValue.Name
+            $Name = $ownerNode
+        }
+
+    If ($ownerNode -ne $primaryReplica -and $cluster -ne $null)
+        {
+            Write-Verbose "Moving owner node to $primaryReplica"
+            Move-ClusterGroup -Name "ClusterGroup" -Cluster $ownerNode -Node $primaryReplica | out-null
+            $Name = $ownerNode
+        }
 
     Write-Verbose -Message "Checking if Cluster $Name is present ..."
     try
@@ -193,16 +238,19 @@ function Test-TargetResource
             try
             {
                 ($oldToken, $context, $newToken) = ImpersonateAs -cred $DomainAdministratorCredential
-         
-                $cluster = Get-Cluster -Name $Name -Domain $ComputerInfo.Domain
-
-                Write-Verbose -Message "Cluster $Name is present"
 
                 if ($cluster)
                 {
+                    Write-Verbose -Message "Cluster $Name is present"
+
                     Write-Verbose -Message "Checking if the node is in cluster $Name ..."
          
-                    $allNodes = Get-ClusterNode -Cluster $Name
+                    $allNodes = Get-ClusterNode -Cluster $Name -ErrorAction SilentlyContinue
+
+                    If (!$allNodes)
+                        {
+                            $allNodes = Get-ClusterNode -Cluster $Name
+                        }
 
                     foreach ($node in $allNodes)
                                                                         {
